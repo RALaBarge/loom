@@ -13,6 +13,29 @@ LLMs forget. Each conversation starts blank. Loom solves this by:
 
 Loom is *not* a proxy, router, or tool manager—it only stores and searches.
 
+## Works With Multiple Harnesses
+
+Loom integrates with:
+- ✅ **Claude Code** — hook-based logging + MCP tools
+- ✅ **Pi** — hook-based logging
+- ✅ **OpenCode** — hook-based logging
+- ✅ **Continue.dev** — MCP tools for IDE integration
+- ✅ **Any HTTP client** — direct REST API
+- ✅ **Any hook-based harness** — universal hook handler
+
+See [INTEGRATION.md](INTEGRATION.md) for setup instructions.
+
+## Quick Install
+
+```bash
+git clone https://github.com/RALaBarge/loom.git
+cd loom
+bash install.sh
+python -m loom serve
+```
+
+Then integrate with your harness (see INTEGRATION.md).
+
 ## Hook Format
 
 Send a POST to `/log` with this shape:
