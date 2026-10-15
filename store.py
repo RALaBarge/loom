@@ -201,6 +201,7 @@ class Store:
             conn.executescript(VEC_SCHEMA)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(vec_messages)")}
             if "message_id" not in cols:
+                conn.execute("BEGIN IMMEDIATE")  # all or nothing: a crash must not drop the vectors
                 saved = conn.execute(
                     "SELECT rowid, embedding, role, conv_id, content, timestamp FROM vec_messages"
                 ).fetchall()
@@ -223,6 +224,9 @@ class Store:
                         (rowid, embedding, role, conv_id, content, timestamp),
                     )
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
