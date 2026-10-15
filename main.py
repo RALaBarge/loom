@@ -93,8 +93,9 @@ async def log_interaction(request: Request):
 
         # Store user message
         if user_msg:
+            user_id = uuid4().hex
             _store.insert_message(
-                msg_id=uuid4().hex,
+                msg_id=user_id,
                 conv_id=conv_id,
                 role="user",
                 content=user_msg,
@@ -111,6 +112,7 @@ async def log_interaction(request: Request):
                         conv_id=conv_id,
                         content=user_msg,
                         timestamp=ts,
+                        message_id=user_id,
                     )
             except Exception:
                 _log.exception("embed failed for user message")
@@ -118,8 +120,9 @@ async def log_interaction(request: Request):
         # Store assistant message
         if assistant_msg:
             usage = resp.get("usage", {})
+            assistant_id = uuid4().hex
             _store.insert_message(
-                msg_id=uuid4().hex,
+                msg_id=assistant_id,
                 conv_id=conv_id,
                 role="assistant",
                 content=assistant_msg,
@@ -138,6 +141,7 @@ async def log_interaction(request: Request):
                         conv_id=conv_id,
                         content=assistant_msg,
                         timestamp=ts,
+                        message_id=assistant_id,
                     )
             except Exception:
                 _log.exception("embed failed for assistant message")
