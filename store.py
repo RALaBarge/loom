@@ -583,7 +583,9 @@ class Store:
                     self._mem_insert(conn, new_id, new_text, new_source, now)
                     self._vec_put(conn, new_id, new_text, new_embedding)
                 elif new_id is not None:
-                    self._mem_row(conn, new_id)
+                    target = self._mem_row(conn, new_id)
+                    if new_id == memory_id or target["status"] != "active":
+                        raise MemoryConflict("new_id must be a different, active memory")
                 conn.execute(
                     "UPDATE memories SET status = 'superseded', superseded_by = ?, updated_at = ? "
                     "WHERE id = ?", (new_id, now, memory_id))

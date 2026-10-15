@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -246,6 +247,38 @@ async def _json_body(request: Request):
     return body, None
 
 
+_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+MAX_MEMORY_CHARS = 8000
+
+
+def _text_field(body: dict, key: str):
+    """A required, non-empty string of bounded length -> (value, None) or (None, 400 response)."""
+    v = body.get(key)
+    if not isinstance(v, str):
+        return None, JSONResponse({"error": f"{key} must be a string"}, status_code=400)
+    v = v.strip()
+    if not v:
+        return None, JSONResponse({"error": f"{key} required"}, status_code=400)
+    if len(v) > MAX_MEMORY_CHARS:
+        return None, JSONResponse({"error": f"{key} too long (max {MAX_MEMORY_CHARS})"}, status_code=400)
+    return v, None
+
+
+def _id_field(body: dict, key: str):
+    """An optional id: absent/None -> (None, None); otherwise must match _ID_RE."""
+    v = body.get(key)
+    if v is None:
+        return None, None
+    if not isinstance(v, str) or not _ID_RE.match(v):
+        return None, JSONResponse({"error": f"{key} must match [A-Za-z0-9._-]{{1,64}}"}, status_code=400)
+    return v, None
+
+
+def _reason_field(body: dict) -> str:
+    r = body.get("reason", "")
+    return r.strip()[:MAX_MEMORY_CHARS] if isinstance(r, str) else ""
+
+
 def _mem_error(e: Exception):
     if isinstance(e, MemoryNotFound):
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -259,10 +292,16 @@ async def memories_search(request: Request):
     body, err = await _json_body(request)
     if err:
         return err
-    query = str(body.get("query", "")).strip()
+    query = body.get("query", "")
+    if not isinstance(query, str):
+        return JSONResponse({"error": "query must be a string"}, status_code=400)
+    query = query.strip()
     if not query:
         return JSONResponse({"results": []})
-    limit = max(1, min(int(body.get("limit", 5)), 50))
+    limit = body.get("limit", 5)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+    limit = max(1, min(limit, 50))
     emb = await _embed_strict(query)
     if emb is None:
         return JSONResponse(_EMBED_DOWN, status_code=503)
@@ -274,13 +313,16 @@ async def memories_create(request: Request):
     body, err = await _json_body(request)
     if err:
         return err
-    text = str(body.get("text", "")).strip()
-    if not text:
-        return JSONResponse({"error": "text required"}, status_code=400)
+    text, err = _text_field(body, "text")
+    if err:
+        return err
+    given_id, err = _id_field(body, "id")
+    if err:
+        return err
     emb = await _embed_strict(text)
     if emb is None:
         return JSONResponse(_EMBED_DOWN, status_code=503)
-    mem_id = str(body.get("id") or uuid4().hex)
+    mem_id = given_id or uuid4().hex
     try:
         ver = _store.create_memory(memory_id=mem_id, text=text,
                                    source=body.get("source"), embedding=emb)
@@ -311,9 +353,9 @@ async def memories_revise(mem_id: str, request: Request):
     body, err = await _json_body(request)
     if err:
         return err
-    text = str(body.get("text", "")).strip()
-    if not text:
-        return JSONResponse({"error": "text required"}, status_code=400)
+    text, err = _text_field(body, "text")
+    if err:
+        return err
     try:
         _store.get_memory(mem_id)
     except MemoryNotFound as e:
@@ -322,7 +364,7 @@ async def memories_revise(mem_id: str, request: Request):
     if emb is None:
         return JSONResponse(_EMBED_DOWN, status_code=503)
     try:
-        ver = _store.revise_memory(mem_id, text=text, reason=str(body.get("reason", "")),
+        ver = _store.revise_memory(mem_id, text=text, reason=_reason_field(body),
                                    embedding=emb)
     except (MemoryConflict, MemoryNotFound) as e:
         return _mem_error(e)
@@ -335,13 +377,15 @@ async def memories_supersede(mem_id: str, request: Request):
     if err:
         return err
     new_text = body.get("new_text")
-    new_id = body.get("new_id")
+    new_id, err = _id_field(body, "new_id")
+    if err:
+        return err
     emb = None
     if new_text is not None:
-        new_text = str(new_text).strip()
-        if not new_text:
-            return JSONResponse({"error": "new_text empty"}, status_code=400)
-        new_id = str(new_id or uuid4().hex)
+        new_text, err = _text_field(body, "new_text")
+        if err:
+            return err
+        new_id = new_id or uuid4().hex
         try:
             _store.get_memory(mem_id)
         except MemoryNotFound as e:
@@ -351,7 +395,7 @@ async def memories_supersede(mem_id: str, request: Request):
             return JSONResponse(_EMBED_DOWN, status_code=503)
     try:
         out = _store.supersede_memory(
-            mem_id, reason=str(body.get("reason", "")), new_id=new_id,
+            mem_id, reason=_reason_field(body), new_id=new_id,
             new_text=new_text, new_source=body.get("source"), new_embedding=emb)
     except (MemoryConflict, MemoryNotFound) as e:
         return _mem_error(e)
@@ -364,7 +408,7 @@ async def memories_retract(mem_id: str, request: Request):
     if err:
         return err
     try:
-        _store.retract_memory(mem_id, reason=str(body.get("reason", "")))
+        _store.retract_memory(mem_id, reason=_reason_field(body))
     except (MemoryConflict, MemoryNotFound) as e:
         return _mem_error(e)
     return JSONResponse({"id": mem_id, "status": "retracted"})

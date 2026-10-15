@@ -295,3 +295,35 @@ def test_search_limit_is_capped(client):
         mem(client, f"m{i}")
     assert len(client.post("/memories/search", json={"query": "m", "limit": 1}).json()["results"]) == 1
     assert len(client.post("/memories/search", json={"query": "m", "limit": 999}).json()["results"]) == 3
+
+
+# ── Input validation (found in review) ─────────────────────────────
+
+@pytest.mark.parametrize("limit", ["abc", None, {"a": 1}, 2.5, True])
+def test_search_limit_must_be_an_integer(client, limit):
+    r = client.post("/memories/search", json={"query": "x", "limit": limit})
+    assert r.status_code == 400
+
+
+@pytest.mark.parametrize("text", [{"a": 1}, [1, 2], True, 5, None, "", "   ", "x" * 8001])
+def test_memory_text_must_be_a_bounded_string(client, text):
+    assert client.post("/memories", json={"text": text}).status_code == 400
+    a = mem(client, "fine")
+    assert client.post(f"/memories/{a['id']}/revise", json={"text": text}).status_code == 400
+    if text is not None:  # null new_text means "no replacement", which is valid
+        assert client.post(f"/memories/{a['id']}/supersede", json={"new_text": text}).status_code == 400
+
+
+@pytest.mark.parametrize("bad", [123, "x" * 65, "a/b", "has space", ""])
+def test_memory_ids_are_restricted(client, bad):
+    assert client.post("/memories", json={"text": "t", "id": bad}).status_code == 400
+
+
+def test_bare_new_id_must_be_a_different_active_memory(client):
+    d, e = mem(client, "dee"), mem(client, "eee")
+    assert client.post(f"/memories/{e['id']}/supersede", json={"new_id": e["id"]}).status_code == 409
+    client.post(f"/memories/{d['id']}/retract", json={"reason": "x"})
+    assert client.post(f"/memories/{e['id']}/supersede", json={"new_id": d["id"]}).status_code == 409
+    assert client.get(f"/memories/{e['id']}").json()["status"] == "active"
+    f = mem(client, "eff")
+    assert client.post(f"/memories/{e['id']}/supersede", json={"new_id": f["id"]}).status_code == 200
