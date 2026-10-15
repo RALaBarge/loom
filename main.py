@@ -10,9 +10,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 try:
-    from .store import Store
+    from .store import MemoryConflict, MemoryNotFound, Store
 except ImportError:
-    from store import Store
+    from store import MemoryConflict, MemoryNotFound, Store
 
 OLLAMA_URL = os.environ.get("LOOM_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 EMBED_MODEL = os.environ.get("LOOM_EMBED_MODEL", "nomic-embed-text")
@@ -209,6 +209,176 @@ async def get_conversation(conv_id: str):
     return JSONResponse({"id": conv_id, "messages": messages})
 
 
+@_app.get("/conversations/{conv_id}/messages")
+async def get_message_range(conv_id: str, from_seq: int = 0,
+                            to_seq: int | None = None, limit: int = 500):
+    """Messages with from_seq <= seq <= to_seq (inclusive), ordered by seq."""
+    if not _store:
+        return JSONResponse({"error": "store not initialized"}, status_code=500)
+    if not _store.conversation_exists(conv_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    msgs = _store.get_message_range(conv_id, from_seq, to_seq, max(1, min(limit, 1000)))
+    return JSONResponse({"id": conv_id, "messages": msgs})
+
+
+# ── Curated memories ────────────────────────────────────────────────
+
+_EMBED_DOWN = {"error": "embedding unavailable"}
+
+
+async def _embed_strict(text: str) -> list[float] | None:
+    """Embedding for the memory routes: None means unavailable (never an empty success)."""
+    try:
+        emb = await _embed(text)
+    except Exception:
+        _log.exception("memory embed failed")
+        return None
+    return emb or None
+
+
+async def _json_body(request: Request):
+    try:
+        body = await request.json()
+    except Exception as e:
+        return None, JSONResponse({"error": f"invalid json: {e}"}, status_code=400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "body must be an object"}, status_code=400)
+    return body, None
+
+
+def _mem_error(e: Exception):
+    if isinstance(e, MemoryNotFound):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if isinstance(e, MemoryConflict):
+        return JSONResponse({"error": str(e)}, status_code=409)
+    raise e
+
+
+@_app.post("/memories/search")
+async def memories_search(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    query = str(body.get("query", "")).strip()
+    if not query:
+        return JSONResponse({"results": []})
+    limit = max(1, min(int(body.get("limit", 5)), 50))
+    emb = await _embed_strict(query)
+    if emb is None:
+        return JSONResponse(_EMBED_DOWN, status_code=503)
+    return JSONResponse({"results": _store.search_memories(emb, limit=limit)})
+
+
+@_app.post("/memories")
+async def memories_create(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    text = str(body.get("text", "")).strip()
+    if not text:
+        return JSONResponse({"error": "text required"}, status_code=400)
+    emb = await _embed_strict(text)
+    if emb is None:
+        return JSONResponse(_EMBED_DOWN, status_code=503)
+    mem_id = str(body.get("id") or uuid4().hex)
+    try:
+        ver = _store.create_memory(memory_id=mem_id, text=text,
+                                   source=body.get("source"), embedding=emb)
+    except (MemoryConflict, MemoryNotFound) as e:
+        return _mem_error(e)
+    return JSONResponse({"id": mem_id, "version": ver})
+
+
+@_app.get("/memories")
+async def memories_list(status: str = "active", limit: int = 50, offset: int = 0):
+    if status not in ("active", "superseded", "retracted", "all"):
+        return JSONResponse({"error": "bad status"}, status_code=400)
+    items = _store.list_memories(status=None if status == "all" else status,
+                                 limit=max(1, min(limit, 200)), offset=max(0, offset))
+    return JSONResponse({"memories": items})
+
+
+@_app.get("/memories/{mem_id}")
+async def memories_get(mem_id: str):
+    try:
+        return JSONResponse(_store.get_memory(mem_id))
+    except MemoryNotFound as e:
+        return _mem_error(e)
+
+
+@_app.post("/memories/{mem_id}/revise")
+async def memories_revise(mem_id: str, request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    text = str(body.get("text", "")).strip()
+    if not text:
+        return JSONResponse({"error": "text required"}, status_code=400)
+    try:
+        _store.get_memory(mem_id)
+    except MemoryNotFound as e:
+        return _mem_error(e)
+    emb = await _embed_strict(text)
+    if emb is None:
+        return JSONResponse(_EMBED_DOWN, status_code=503)
+    try:
+        ver = _store.revise_memory(mem_id, text=text, reason=str(body.get("reason", "")),
+                                   embedding=emb)
+    except (MemoryConflict, MemoryNotFound) as e:
+        return _mem_error(e)
+    return JSONResponse({"id": mem_id, "version": ver})
+
+
+@_app.post("/memories/{mem_id}/supersede")
+async def memories_supersede(mem_id: str, request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    new_text = body.get("new_text")
+    new_id = body.get("new_id")
+    emb = None
+    if new_text is not None:
+        new_text = str(new_text).strip()
+        if not new_text:
+            return JSONResponse({"error": "new_text empty"}, status_code=400)
+        new_id = str(new_id or uuid4().hex)
+        try:
+            _store.get_memory(mem_id)
+        except MemoryNotFound as e:
+            return _mem_error(e)
+        emb = await _embed_strict(new_text)
+        if emb is None:
+            return JSONResponse(_EMBED_DOWN, status_code=503)
+    try:
+        out = _store.supersede_memory(
+            mem_id, reason=str(body.get("reason", "")), new_id=new_id,
+            new_text=new_text, new_source=body.get("source"), new_embedding=emb)
+    except (MemoryConflict, MemoryNotFound) as e:
+        return _mem_error(e)
+    return JSONResponse({"id": mem_id, "superseded_by": out})
+
+
+@_app.post("/memories/{mem_id}/retract")
+async def memories_retract(mem_id: str, request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    try:
+        _store.retract_memory(mem_id, reason=str(body.get("reason", "")))
+    except (MemoryConflict, MemoryNotFound) as e:
+        return _mem_error(e)
+    return JSONResponse({"id": mem_id, "status": "retracted"})
+
+
+@_app.post("/memories/{mem_id}/touch")
+async def memories_touch(mem_id: str):
+    try:
+        _store.touch_memory(mem_id)
+    except MemoryNotFound as e:
+        return _mem_error(e)
+    return JSONResponse({"id": mem_id})
+
+
 @_app.get("/stats")
 async def stats():
     """Get storage statistics."""
@@ -220,7 +390,7 @@ async def stats():
 @_app.get("/health")
 async def health():
     """Health check."""
-    return {"ok": True}
+    return {"ok": True, "features": ["seq", "memories_v1"]}
 
 
 def serve():

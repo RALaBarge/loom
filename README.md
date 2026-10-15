@@ -154,6 +154,41 @@ Response:
 curl http://localhost:9741/conversations/abc123
 ```
 
+### `GET /conversations/{id}/messages` — Read a range of turns
+
+```bash
+curl "http://localhost:9741/conversations/abc123/messages?from_seq=10&to_seq=14&limit=100"
+```
+
+Every message has a per-conversation `seq` (0, 1, 2, ...) assigned when it is stored. The
+range is inclusive, ordered by `seq`, and each item has `id`, `seq`, `role`, `content`,
+`timestamp`. Unknown conversation: `404`. Empty range: an empty list. `limit` defaults to 500 (max 1000).
+
+**Append-only.** Messages are never rewritten: sending a message `id` that already exists
+changes nothing, and no route deletes or edits messages. `seq` also appears in conversation
+reads and search results. Databases created before `seq` existed are migrated on startup
+(rows numbered by timestamp, then insertion order).
+
+### Curated memories
+
+Memories are short facts you chose to keep, separate from the raw log. Each keeps its full
+version history; nothing is ever hard-deleted. Only `active` memories are searchable.
+
+| Route | Body | Effect |
+|---|---|---|
+| `POST /memories` | `{"id"?, "text", "source"?}` | Create version 1 (`source` is any JSON) |
+| `GET /memories?status=active&limit=&offset=` | | List (`status`: active, superseded, retracted, all) |
+| `GET /memories/{id}` | | One memory with all versions |
+| `POST /memories/{id}/revise` | `{"text", "reason"?}` | New version, re-embedded |
+| `POST /memories/{id}/supersede` | `{"new_text"?, "new_id"?, "reason"?}` | Mark superseded; optionally create the replacement in the same transaction |
+| `POST /memories/{id}/retract` | `{"reason"}` | Soft delete |
+| `POST /memories/{id}/touch` | | Update `last_seen_at` only |
+| `POST /memories/search` | `{"query", "limit"}` | Nearest active memories (default 5, max 50) |
+
+If the embedding service is down, these routes return `503 {"error": "embedding unavailable"}`
+and write nothing (unlike `/search`, which still answers `200` with an `error` field).
+Changing a superseded or retracted memory returns `409`.
+
 ### `GET /stats` — Storage statistics
 
 ```bash
@@ -175,6 +210,9 @@ Response:
 ```bash
 curl http://localhost:9741/health
 ```
+
+Response: `{"ok": true, "features": ["seq", "memories_v1"]}`. Clients can check `features`
+before relying on the routes above.
 
 ## CLI
 

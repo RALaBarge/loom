@@ -50,6 +50,25 @@ CREATE TABLE IF NOT EXISTS memory_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_entries_project ON memory_entries(project);
 CREATE INDEX IF NOT EXISTS idx_memory_entries_created ON memory_entries(created_at);
+CREATE TABLE IF NOT EXISTS memories (
+    id TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active','superseded','retracted')),
+    superseded_by TEXT,
+    source TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    last_seen_at TEXT
+);
+CREATE TABLE IF NOT EXISTS memory_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id TEXT,
+    version INTEGER,
+    text TEXT,
+    reason TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_versions_mem ON memory_versions(memory_id, version);
 """
 
 VEC_SCHEMA = """
@@ -67,6 +86,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(
     +summary TEXT,
     +created_at TEXT
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
+    embedding FLOAT[768],
+    +memory_id TEXT,
+    +text TEXT
+);
 """
 
 MSG_MIGRATIONS = [
@@ -76,7 +100,16 @@ MSG_MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN provider TEXT DEFAULT ''",
     "ALTER TABLE messages ADD COLUMN response_headers TEXT DEFAULT '{}'",
     "ALTER TABLE messages ADD COLUMN context_id TEXT DEFAULT ''",
+    "ALTER TABLE messages ADD COLUMN seq INTEGER",
 ]
+
+
+class MemoryNotFound(Exception):
+    """No memory with that id."""
+
+
+class MemoryConflict(Exception):
+    """The memory exists but is not in a state that allows the operation."""
 
 
 class Store:
@@ -97,6 +130,32 @@ class Store:
                     conn.execute(sql)
                 except sqlite3.OperationalError:
                     pass
+            self._backfill_seq(conn)
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conv_seq "
+                "ON messages(conversation_id, seq)"
+            )
+
+    @staticmethod
+    def _backfill_seq(conn):
+        """Give every message without a seq its per-conversation turn number.
+
+        Rows are numbered in (timestamp, rowid) order after the highest seq the
+        conversation already has, so the pass is safe to repeat.
+        """
+        convs = [r[0] for r in conn.execute(
+            "SELECT DISTINCT conversation_id FROM messages WHERE seq IS NULL")]
+        for conv in convs:
+            nxt = conn.execute(
+                "SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE conversation_id = ?",
+                (conv,),
+            ).fetchone()[0]
+            ids = [r[0] for r in conn.execute(
+                "SELECT rowid FROM messages WHERE conversation_id = ? AND seq IS NULL "
+                "ORDER BY timestamp, rowid", (conv,))]
+            for rid in ids:
+                conn.execute("UPDATE messages SET seq = ? WHERE rowid = ?", (nxt, rid))
+                nxt += 1
 
     @contextmanager
     def _conn(self):
@@ -147,19 +206,28 @@ class Store:
                        latency_ms: float | None = None, reasoning_content: str = "",
                        finish_reason: str = "", tool_calls: str = "[]",
                        provider: str = "", response_headers: str = "{}",
-                       context_id: str = ""):
-        """Store a single message with optional metadata (tokens, latency, reasoning)."""
+                       context_id: str = "") -> bool:
+        """Append a message with optional metadata (tokens, latency, reasoning).
+
+        Append-only: a message id that already exists is left untouched. Returns
+        True if a row was inserted. The per-conversation seq is assigned inside
+        the same write transaction, so concurrent writers never share a number.
+        """
         with self._conn() as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO messages
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO messages
                    (id, conversation_id, role, content, model, timestamp,
                     token_count, latency_ms, reasoning_content, finish_reason,
-                    tool_calls, provider, response_headers, context_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    tool_calls, provider, response_headers, context_id, seq)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           (SELECT COALESCE(MAX(seq), -1) + 1 FROM messages
+                            WHERE conversation_id = ?))""",
                 (msg_id, conv_id, role, content, model, timestamp,
                  token_count, latency_ms, reasoning_content, finish_reason,
-                 tool_calls, provider, response_headers, context_id),
+                 tool_calls, provider, response_headers, context_id, conv_id),
             )
+            return cur.rowcount > 0
 
     def insert_context_blob(self, blob_id: str, conv_id: str,
                             messages_json: bytes, created_at: str):
@@ -205,16 +273,27 @@ class Store:
                        WHERE embedding MATCH ? ORDER BY distance LIMIT ?""",
                     (json.dumps(embedding), limit),
                 ).fetchall()
-            return [
+            out = [
                 {
                     "distance": round(r["distance"], 4),
                     "role": r["role"],
                     "conversation_id": r["conv_id"],
                     "content": r["content"],
                     "timestamp": r["timestamp"],
+                    "seq": None,
                 }
                 for r in rows
             ]
+            for item in out:
+                m = conn.execute(
+                    """SELECT seq FROM messages WHERE conversation_id = ? AND role = ?
+                       AND timestamp = ? AND content = ? ORDER BY seq LIMIT 1""",
+                    (item["conversation_id"], item["role"], item["timestamp"],
+                     item["content"]),
+                ).fetchone()
+                if m:
+                    item["seq"] = m["seq"]
+            return out
         finally:
             conn.close()
 
@@ -245,11 +324,31 @@ class Store:
         """Get all messages in a conversation ordered by timestamp."""
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT id, role, content, model, timestamp, token_count, latency_ms,
+                """SELECT id, seq, role, content, model, timestamp, token_count, latency_ms,
                           reasoning_content, finish_reason, tool_calls, provider,
                           response_headers, context_id
-                   FROM messages WHERE conversation_id = ? ORDER BY timestamp""",
+                   FROM messages WHERE conversation_id = ? ORDER BY seq, timestamp""",
                 (conv_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def conversation_exists(self, conv_id: str) -> bool:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT 1 FROM conversations WHERE id = ?", (conv_id,)
+            ).fetchone() is not None
+
+    def get_message_range(self, conv_id: str, from_seq: int = 0,
+                          to_seq: int | None = None,
+                          limit: int = 500) -> list[dict[str, Any]]:
+        """Messages with from_seq <= seq <= to_seq (inclusive), ordered by seq."""
+        hi = to_seq if to_seq is not None else 2**62
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT id, seq, role, content, timestamp FROM messages
+                   WHERE conversation_id = ? AND seq >= ? AND seq <= ?
+                   ORDER BY seq LIMIT ?""",
+                (conv_id, from_seq, hi, limit),
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -258,16 +357,16 @@ class Store:
         """Get messages before and after a specific timestamp for context."""
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT id, role, content, model, timestamp
+                """SELECT id, seq, role, content, model, timestamp
                    FROM messages WHERE conversation_id = ? AND timestamp < ?
-                   ORDER BY timestamp DESC LIMIT ?""",
+                   ORDER BY timestamp DESC, seq DESC LIMIT ?""",
                 (conv_id, timestamp, before),
             ).fetchall()
             before_msgs = [dict(r) for r in reversed(rows)]
             rows = conn.execute(
-                """SELECT id, role, content, model, timestamp
+                """SELECT id, seq, role, content, model, timestamp
                    FROM messages WHERE conversation_id = ? AND timestamp > ?
-                   ORDER BY timestamp LIMIT ?""",
+                   ORDER BY timestamp, seq LIMIT ?""",
                 (conv_id, timestamp, after),
             ).fetchall()
             after_msgs = [dict(r) for r in rows]
@@ -377,6 +476,223 @@ class Store:
                    GROUP BY project ORDER BY last DESC"""
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ── Curated memories with version history ───────────────────────
+    # Only active memories have a vec row; relational rows and versions are
+    # kept forever (retract is a soft delete). Embeddings are computed by the
+    # caller before these methods run, so a failed embedding writes nothing.
+
+    @staticmethod
+    def _mem_dump(source: Any) -> str | None:
+        if source is None:
+            return None
+        return source if isinstance(source, str) else json.dumps(source)
+
+    @staticmethod
+    def _vec_drop(conn, memory_id: str):
+        for r in conn.execute(
+                "SELECT rowid FROM vec_memories WHERE memory_id = ?", (memory_id,)).fetchall():
+            conn.execute("DELETE FROM vec_memories WHERE rowid = ?", (r["rowid"],))
+
+    @staticmethod
+    def _vec_put(conn, memory_id: str, text: str, embedding: list[float]):
+        conn.execute(
+            "INSERT INTO vec_memories(embedding, memory_id, text) VALUES (?, ?, ?)",
+            (json.dumps(embedding), memory_id, text),
+        )
+
+    @staticmethod
+    def _mem_row(conn, memory_id: str):
+        row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        if row is None:
+            raise MemoryNotFound(memory_id)
+        return row
+
+    @staticmethod
+    def _mem_insert(conn, memory_id: str, text: str, source: Any, now: str):
+        if conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
+            raise MemoryConflict(f"memory {memory_id} already exists")
+        conn.execute(
+            """INSERT INTO memories (id, text, status, superseded_by, source,
+                                     created_at, updated_at, last_seen_at)
+               VALUES (?, ?, 'active', NULL, ?, ?, ?, ?)""",
+            (memory_id, text, Store._mem_dump(source), now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO memory_versions (memory_id, version, text, reason, created_at) "
+            "VALUES (?, 1, ?, 'created', ?)", (memory_id, text, now),
+        )
+
+    def create_memory(self, *, memory_id: str, text: str, source: Any,
+                      embedding: list[float]) -> int:
+        conn = self._raw_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._mem_insert(conn, memory_id, text, source, _now())
+                self._vec_put(conn, memory_id, text, embedding)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return 1
+        finally:
+            conn.close()
+
+    def revise_memory(self, memory_id: str, *, text: str, reason: str,
+                      embedding: list[float]) -> int:
+        conn = self._raw_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._mem_row(conn, memory_id)
+                if row["status"] != "active":
+                    raise MemoryConflict(f"memory {memory_id} is {row['status']}")
+                now = _now()
+                ver = conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 FROM memory_versions WHERE memory_id = ?",
+                    (memory_id,)).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO memory_versions (memory_id, version, text, reason, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)", (memory_id, ver, text, reason, now))
+                conn.execute("UPDATE memories SET text = ?, updated_at = ? WHERE id = ?",
+                             (text, now, memory_id))
+                self._vec_drop(conn, memory_id)
+                self._vec_put(conn, memory_id, text, embedding)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return ver
+        finally:
+            conn.close()
+
+    def supersede_memory(self, memory_id: str, *, reason: str, new_id: str | None = None,
+                         new_text: str | None = None, new_source: Any = None,
+                         new_embedding: list[float] | None = None) -> str | None:
+        """Mark a memory superseded; optionally create its replacement in the same transaction."""
+        conn = self._raw_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._mem_row(conn, memory_id)
+                if row["status"] != "active":
+                    raise MemoryConflict(f"memory {memory_id} is {row['status']}")
+                now = _now()
+                if new_text is not None:
+                    self._mem_insert(conn, new_id, new_text, new_source, now)
+                    self._vec_put(conn, new_id, new_text, new_embedding)
+                elif new_id is not None:
+                    self._mem_row(conn, new_id)
+                conn.execute(
+                    "UPDATE memories SET status = 'superseded', superseded_by = ?, updated_at = ? "
+                    "WHERE id = ?", (new_id, now, memory_id))
+                ver = conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 FROM memory_versions WHERE memory_id = ?",
+                    (memory_id,)).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO memory_versions (memory_id, version, text, reason, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (memory_id, ver, row["text"], f"superseded: {reason}", now))
+                self._vec_drop(conn, memory_id)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return new_id
+        finally:
+            conn.close()
+
+    def retract_memory(self, memory_id: str, *, reason: str):
+        conn = self._raw_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._mem_row(conn, memory_id)
+                if row["status"] != "active":
+                    raise MemoryConflict(f"memory {memory_id} is {row['status']}")
+                now = _now()
+                conn.execute("UPDATE memories SET status = 'retracted', updated_at = ? WHERE id = ?",
+                             (now, memory_id))
+                ver = conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 FROM memory_versions WHERE memory_id = ?",
+                    (memory_id,)).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO memory_versions (memory_id, version, text, reason, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (memory_id, ver, row["text"], f"retracted: {reason}", now))
+                self._vec_drop(conn, memory_id)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+
+    def touch_memory(self, memory_id: str):
+        with self._conn() as conn:
+            cur = conn.execute("UPDATE memories SET last_seen_at = ? WHERE id = ?",
+                               (_now(), memory_id))
+            if cur.rowcount == 0:
+                raise MemoryNotFound(memory_id)
+
+    def _mem_public(self, conn, row) -> dict[str, Any]:
+        out = dict(row)
+        src = out.get("source")
+        if src:
+            try:
+                out["source"] = json.loads(src)
+            except ValueError:
+                pass
+        out["version"] = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM memory_versions WHERE memory_id = ?",
+            (row["id"],)).fetchone()[0]
+        return out
+
+    def get_memory(self, memory_id: str) -> dict[str, Any]:
+        with self._conn() as conn:
+            row = self._mem_row(conn, memory_id)
+            out = self._mem_public(conn, row)
+            out["versions"] = [dict(r) for r in conn.execute(
+                "SELECT version, text, reason, created_at FROM memory_versions "
+                "WHERE memory_id = ? ORDER BY version", (memory_id,))]
+            return out
+
+    def list_memories(self, *, status: str | None = "active", limit: int = 50,
+                      offset: int = 0) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM memories WHERE status = ? ORDER BY created_at DESC, id "
+                    "LIMIT ? OFFSET ?", (status, limit, offset)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM memories ORDER BY created_at DESC, id LIMIT ? OFFSET ?",
+                    (limit, offset)).fetchall()
+            return [self._mem_public(conn, r) for r in rows]
+
+    def search_memories(self, embedding: list[float], limit: int = 5) -> list[dict[str, Any]]:
+        """Nearest active memories (only active ones have a vec row)."""
+        conn = self._raw_conn()
+        try:
+            rows = conn.execute(
+                """SELECT rowid, distance, memory_id, text FROM vec_memories
+                   WHERE embedding MATCH ? ORDER BY distance LIMIT ?""",
+                (json.dumps(embedding), limit),
+            ).fetchall()
+            out = []
+            for r in rows:
+                m = conn.execute("SELECT updated_at FROM memories WHERE id = ?",
+                                 (r["memory_id"],)).fetchone()
+                ver = conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM memory_versions WHERE memory_id = ?",
+                    (r["memory_id"],)).fetchone()[0]
+                out.append({"id": r["memory_id"], "text": r["text"],
+                            "distance": round(r["distance"], 4), "version": ver,
+                            "updated_at": m["updated_at"] if m else None})
+            return out
+        finally:
+            conn.close()
 
     def get_stats(self) -> dict[str, Any]:
         """Get storage statistics (conversation, message, and token counts)."""
