@@ -127,6 +127,9 @@ Body parameters for `/search`:
 - `role`: Filter by "user" or "assistant" (optional)
 - `conversation_id`: Filter to a specific conversation (optional)
 
+Each result carries `id` (via `message_id`), `seq` and `conversation_id`, so any hit can be
+addressed directly with `GET /conversations/{conversation_id}/messages?from_seq=&to_seq=`.
+
 ### `GET /conversations` — List conversations
 
 ```bash
@@ -168,6 +171,16 @@ range is inclusive, ordered by `seq`, and each item has `id`, `seq`, `role`, `co
 changes nothing, and no route deletes or edits messages. `seq` also appears in conversation
 reads and search results. Databases created before `seq` existed are migrated on startup
 (rows numbered by timestamp, then insertion order).
+
+**How search resolves `seq`.** Each vector row stores the `messages.id` it came from
+(`vec_messages.message_id`), and search results resolve `seq` by that id, so two messages that
+share role, timestamp and content still report their own `seq`. Search results include
+`message_id` for the same reason. Rows written before `message_id` existed (and therefore have
+it as `NULL`) fall back to matching on `(conversation_id, role, timestamp, content)` and take
+the lowest `seq`, which is ambiguous in exactly that duplicate case — re-logged turns are
+unambiguous, older ones may not be. A database whose `vec_messages` predates the column is
+rebuilt on startup (vectors and row ids preserved), since SQLite cannot add a column to a
+virtual table in place.
 
 ### Curated memories
 

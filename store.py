@@ -77,7 +77,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_messages USING vec0(
     +role TEXT,
     +conv_id TEXT,
     +content TEXT,
-    +timestamp TEXT
+    +timestamp TEXT,
+    +message_id TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(
     embedding FLOAT[768],
@@ -184,10 +185,43 @@ class Store:
         return conn
 
     def _init_vec(self):
-        """Initialize vector embedding tables with sqlite-vec schema."""
+        """Initialize vector embedding tables with sqlite-vec schema.
+
+        ``CREATE VIRTUAL TABLE IF NOT EXISTS`` cannot add a column to an existing
+        table, and SQLite refuses ``ALTER TABLE`` on a virtual table, so a database
+        created before ``vec_messages.message_id`` existed would keep the old shape and
+        every search would fail on the missing column. Rebuild the table instead: copy
+        the rows out, drop it (which also removes sqlite-vec's shadow tables), recreate
+        it with the extra column under the same name, and put the rows back with their
+        original rowids so vectors and distances are unchanged. Existing rows keep
+        ``message_id`` NULL and fall back to the ambiguous lookup in ``search``.
+        """
         conn = self._raw_conn()
         try:
             conn.executescript(VEC_SCHEMA)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(vec_messages)")}
+            if "message_id" not in cols:
+                saved = conn.execute(
+                    "SELECT rowid, embedding, role, conv_id, content, timestamp FROM vec_messages"
+                ).fetchall()
+                conn.execute("DROP TABLE vec_messages")
+                conn.execute(
+                    """CREATE VIRTUAL TABLE vec_messages USING vec0(
+                           embedding FLOAT[768],
+                           +role TEXT,
+                           +conv_id TEXT,
+                           +content TEXT,
+                           +timestamp TEXT,
+                           +message_id TEXT
+                       )"""
+                )
+                for rowid, embedding, role, conv_id, content, timestamp in saved:
+                    conn.execute(
+                        """INSERT INTO vec_messages(rowid, embedding, role, conv_id,
+                                                    content, timestamp, message_id)
+                           VALUES (?, ?, ?, ?, ?, ?, NULL)""",
+                        (rowid, embedding, role, conv_id, content, timestamp),
+                    )
             conn.commit()
         finally:
             conn.close()
@@ -239,14 +273,20 @@ class Store:
             )
 
     def insert_embedding(self, *, embedding: list[float], role: str, conv_id: str,
-                         content: str, timestamp: str):
-        """Store a message embedding for semantic search."""
+                         content: str, timestamp: str, message_id: str | None = None):
+        """Store a message embedding for semantic search.
+
+        Pass ``message_id`` (the ``messages.id`` this vector came from) so search
+        results can report the exact row's ``seq``. Without it the seq lookup has to
+        guess by (conversation, role, timestamp, content), which is ambiguous when two
+        messages share all four — see ``search``.
+        """
         conn = self._raw_conn()
         try:
             conn.execute(
-                """INSERT INTO vec_messages(embedding, role, conv_id, content, timestamp)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (json.dumps(embedding), role, conv_id, content, timestamp),
+                """INSERT INTO vec_messages(embedding, role, conv_id, content, timestamp, message_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (json.dumps(embedding), role, conv_id, content, timestamp, message_id),
             )
             conn.commit()
         finally:
@@ -260,7 +300,7 @@ class Store:
             if role:
                 rows = conn.execute(
                     """SELECT * FROM (
-                           SELECT rowid, distance, role, conv_id, content, timestamp
+                           SELECT rowid, distance, role, conv_id, content, timestamp, message_id
                            FROM vec_messages
                            WHERE embedding MATCH ? ORDER BY distance LIMIT 200
                        ) WHERE role = ? LIMIT ?""",
@@ -268,31 +308,40 @@ class Store:
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT rowid, distance, role, conv_id, content, timestamp
+                    """SELECT rowid, distance, role, conv_id, content, timestamp, message_id
                        FROM vec_messages
                        WHERE embedding MATCH ? ORDER BY distance LIMIT ?""",
                     (json.dumps(embedding), limit),
                 ).fetchall()
-            out = [
-                {
+            out = []
+            for r in rows:
+                seq = None
+                if r["message_id"]:
+                    # Exact: the vector row names the message row it came from.
+                    m = conn.execute(
+                        "SELECT seq FROM messages WHERE id = ?", (r["message_id"],)
+                    ).fetchone()
+                    if m:
+                        seq = m["seq"]
+                if seq is None:
+                    # Legacy row written before message_id existed, or the message is gone.
+                    # Best effort, and ambiguous when two messages share all four fields.
+                    m = conn.execute(
+                        """SELECT seq FROM messages WHERE conversation_id = ? AND role = ?
+                           AND timestamp = ? AND content = ? ORDER BY seq LIMIT 1""",
+                        (r["conv_id"], r["role"], r["timestamp"], r["content"]),
+                    ).fetchone()
+                    if m:
+                        seq = m["seq"]
+                out.append({
                     "distance": round(r["distance"], 4),
                     "role": r["role"],
                     "conversation_id": r["conv_id"],
                     "content": r["content"],
                     "timestamp": r["timestamp"],
-                    "seq": None,
-                }
-                for r in rows
-            ]
-            for item in out:
-                m = conn.execute(
-                    """SELECT seq FROM messages WHERE conversation_id = ? AND role = ?
-                       AND timestamp = ? AND content = ? ORDER BY seq LIMIT 1""",
-                    (item["conversation_id"], item["role"], item["timestamp"],
-                     item["content"]),
-                ).fetchone()
-                if m:
-                    item["seq"] = m["seq"]
+                    "message_id": r["message_id"],
+                    "seq": seq,
+                })
             return out
         finally:
             conn.close()

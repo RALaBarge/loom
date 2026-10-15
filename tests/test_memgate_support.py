@@ -153,6 +153,82 @@ def test_seq_in_conversation_and_search_payloads(client):
     assert hits and hits[0]["seq"] == 0
 
 
+def test_search_seq_is_exact_when_messages_share_role_ts_and_content(client):
+    """Two messages that share (role, timestamp, content) must each report their own seq.
+
+    The vector row names its message id, so the lookup is exact rather than a
+    four-column guess that always resolves to the lowest seq.
+    """
+    st = main._store
+    for mid, text in (("dup1", "same text"), ("dup2", "same text"), ("other", "different")):
+        st.insert_message(msg_id=mid, conv_id="c", role="assistant", content=text,
+                          model="m", timestamp="2026-01-01T00:00:00Z")
+    # One vector row per message, exactly as /log would write them.
+    for mid in ("dup1", "dup2"):
+        st.insert_embedding(embedding=stub_vec("same text"), role="assistant", conv_id="c",
+                            content="same text", timestamp="2026-01-01T00:00:00Z",
+                            message_id=mid)
+    hits = {h["message_id"]: h for h in st.search(stub_vec("same text"), limit=10)}
+    assert set(hits) == {"dup1", "dup2"}
+    assert hits["dup1"]["seq"] == 0
+    assert hits["dup2"]["seq"] == 1          # not 0: the old lookup collapsed both to seq 0
+
+
+def test_log_writes_message_id_so_search_seq_survives_duplicate_text(client):
+    """End to end: two identical turns logged into one conversation keep distinct seqs.
+
+    /log embeds both the user and the assistant message of each turn, so the two
+    identical turns yield four vector rows — the point is that each one resolves to its
+    own seq instead of collapsing onto the first match.
+    """
+    log(client, "c", "same question", "same answer")
+    log(client, "c", "same question", "same answer")
+    st = main._store
+    hits = st.search(stub_vec("same answer"), limit=10)
+    assert len(hits) == 4
+    assert len({h["message_id"] for h in hits}) == 4   # each names its own row
+    assistant = sorted((h["seq"] for h in hits if h["role"] == "assistant"))
+    assert assistant == [1, 3]                         # assistant rows of turn 0 and 1
+    for h in hits:
+        row = client.get("/conversations/c/messages",
+                         params={"from_seq": h["seq"], "to_seq": h["seq"]}).json()["messages"]
+        assert len(row) == 1
+        assert row[0]["content"] == h["content"]       # same seq -> same text as reported
+        assert row[0]["role"] == h["role"]
+
+
+def test_legacy_vec_table_is_rebuilt_and_old_rows_still_searchable(tmp_path):
+    """A pre-message_id database must open, gain the column, and keep its vectors."""
+    import sqlite_vec
+
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.executescript(OLD_SCHEMA)
+    conn.execute("INSERT INTO conversations (id, created_at) VALUES ('c', 't')")
+    conn.execute("INSERT INTO messages (id, conversation_id, role, content, timestamp) "
+                 "VALUES ('m1', 'c', 'user', 'legacy text', 't1')")
+    conn.execute("CREATE VIRTUAL TABLE vec_messages USING vec0("
+                 "embedding FLOAT[768], +role TEXT, +conv_id TEXT, "
+                 "+content TEXT, +timestamp TEXT)")
+    conn.execute("INSERT INTO vec_messages(embedding, role, conv_id, content, timestamp) "
+                 "VALUES (?, 'user', 'c', 'legacy text', 't1')",
+                 (__import__("json").dumps(stub_vec("legacy text")),))
+    conn.commit()
+    conn.close()
+
+    st = Store(db)                                  # migrates on open
+    hits = st.search(stub_vec("legacy text"), limit=5)
+    assert len(hits) == 1
+    assert hits[0]["content"] == "legacy text"
+    assert hits[0]["message_id"] is None            # old row: id unknown
+    assert hits[0]["seq"] == 0                      # resolved by the fallback lookup
+    # Reopening is idempotent and the column stays.
+    st2 = Store(db)
+    assert st2.search(stub_vec("legacy text"), limit=5)[0]["content"] == "legacy text"
+
+
 def test_health_lists_features(client):
     body = client.get("/health").json()
     assert body["ok"] is True and set(body["features"]) == {"seq", "memories_v1"}
