@@ -327,4 +327,4 @@ Clean code, full documentation, proper error handling. No secrets, no TODOs.
 
 ## License
 
-MIT
+[MIT](LICENSE).
