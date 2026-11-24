@@ -94,7 +94,7 @@ def now() -> str:
 
 def _word(e: dict, key: str, required: bool = False, rx=WORD_RE) -> str:
     v = e.get(key)
-    if v is None and not required:
+    if v in (None, "") and not required:
         return ""
     if not isinstance(v, str) or not v or not rx.match(v):
         raise Invalid(f"{key} must match {rx.pattern}")

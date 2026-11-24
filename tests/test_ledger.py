@@ -65,6 +65,11 @@ def test_ingest_acks_after_commit_and_retry_is_a_noop(client):
     assert len(client.get("/events").json()["events"]) == 3
 
 
+def test_optional_fields_may_be_empty(client):
+    e = ev(1, role="", provider="", model="", parent=None)
+    assert client.post("/events", json={"events": [e]}, headers=H("ingest")).status_code == 200
+
+
 def test_a_bad_event_rejects_the_whole_batch(client):
     r = client.post("/events", json={"events": [ev(1), ev(2, trust="maybe")]}, headers=H("ingest"))
     assert r.status_code == 400 and "trust" in r.json()["error"]
