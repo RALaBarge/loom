@@ -33,6 +33,11 @@ DB_PATH = str(Path(os.environ.get("LOOM_DB_PATH", str(Path.home() / ".loom" / "l
 # Unset, Loom runs open as before (a standalone install with no other local users).
 TOKENS_DIR = os.environ.get("LOOM_TOKENS_DIR", "")
 MAX_EVENTS_BODY = 16 * 1024 * 1024
+# A CPU without AVX embeds at about 0.5 s per token, so a request may take minutes; one cut off early keeps the
+# embedding server busy anyway. Events are embedded from their first EMBED_CHARS characters (the text itself is kept
+# whole); that is enough to find them.
+EMBED_TIMEOUT = 300
+EMBED_CHARS = 1500
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s [loom] %(message)s"
@@ -86,7 +91,7 @@ async def _embed(text: str) -> list[float]:
     """Request embedding from Ollama."""
     if not text.strip():
         return []
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=EMBED_TIMEOUT) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/embed",
             json={"model": EMBED_MODEL, "input": [text]},
@@ -652,7 +657,7 @@ async def _embed_worker():
         try:
             work = _ledger.pending_embeddings(EMBED_MODEL) if _ledger else []
             for seq, text in work:
-                emb = await _embed_strict(text)
+                emb = await _embed_strict(text[:EMBED_CHARS])
                 if emb is None:
                     break
                 _ledger.put_embedding(seq, EMBED_MODEL, emb)
