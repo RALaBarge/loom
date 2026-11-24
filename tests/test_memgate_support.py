@@ -231,7 +231,7 @@ def test_legacy_vec_table_is_rebuilt_and_old_rows_still_searchable(tmp_path):
 
 def test_health_lists_features(client):
     body = client.get("/health").json()
-    assert body["ok"] is True and set(body["features"]) == {"seq", "memories_v1"}
+    assert body["ok"] is True and set(body["features"]) == {"seq", "memories_v1", "events_v1", "proposals_v1"}
 
 
 def test_no_route_deletes_or_rewrites_messages(client):

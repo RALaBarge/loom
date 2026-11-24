@@ -227,6 +227,28 @@ curl http://localhost:9741/health
 Response: `{"ok": true, "features": ["seq", "memories_v1"]}`. Clients can check `features`
 before relying on the routes above.
 
+## Events and the memory review queue
+
+`ledger.py` adds an append-only event store next to `/log`, and a queue of proposed memories that a person decides.
+
+- `POST /events` `{"events": [...]}` stores a batch in one transaction and replies after the commit with one ack per
+  event (`seq`, content `hash`, `new`). An event is one entry a harness wrote (for Pi, one session-file line): `source`,
+  `session`, `id`, `parent`, `type`, `role`, `ts`, `model`, `provider`, `trust` (`trusted` or `untrusted`), `redactor`,
+  `raw` (the redacted entry) and `text` (what may be embedded). (source, session, id) is unique, so a retry stores
+  nothing twice. `raw` goes into a content-addressed blob.
+- `untrusted` events (tool output) are kept for audit and replay but never embedded and never returned by search.
+- A background task embeds trusted `text`; the index records the embedding model, so a new model re-embeds.
+- `GET /events?session=&after=&raw=`, `GET /events/sessions`, `POST /events/search`.
+- `POST /events/forget` `{"session"}` tombstones a session; `POST /events/purge` deletes forgotten content;
+  `POST /events/{seq}/scrub` replaces one event's content (the only edit, for a secret a newer redactor found).
+- `POST /proposals` `{"text", "by": "ryan"|"agent"|"proposer", "events": [seq], "note"}` queues a candidate memory;
+  `POST /proposals/{id}/decide` `{"action": "accept"|"reject", "text"?}` decides it; `POST /proposals/pop` turns every
+  accepted proposal into a memory (source: the proposal, who proposed it, its events).
+
+With `LOOM_TOKENS_DIR` set, each write needs `Authorization: Bearer` with its role's token from `<dir>/<role>.token`:
+`ingest` (events, `/log`), `memq` (propose, pop, touch) and `review` (decide, memory edits, forget, purge, scrub). A role
+without a token file is locked. Reads stay open. Unset, Loom is open as before.
+
 ## CLI
 
 ### Start the server
