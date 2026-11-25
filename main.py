@@ -321,11 +321,17 @@ async def events_ingest(request: Request):
     """A batch of events. The reply comes after the commit; an ack per event is the sender's receipt."""
     if (deny := _denied(request, "ingest")):
         return deny
-    if int(request.headers.get("content-length") or 0) > MAX_EVENTS_BODY:
-        return JSONResponse({"error": "batch too large"}, status_code=413)
-    body, err = await _json_body(request)
-    if err:
-        return err
+    data = b""
+    async for chunk in request.stream():   # counted as it arrives: a chunked body has no Content-Length to check
+        data += chunk
+        if len(data) > MAX_EVENTS_BODY:
+            return JSONResponse({"error": "batch too large"}, status_code=413)
+    try:
+        body = json.loads(data)
+    except ValueError as e:
+        return JSONResponse({"error": f"invalid json: {e}"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be an object"}, status_code=400)
     events = body.get("events")
     if not isinstance(events, list) or not 1 <= len(events) <= L.MAX_BATCH:
         return JSONResponse({"error": f"events must be a list of 1 to {L.MAX_BATCH}"}, status_code=400)
@@ -437,7 +443,10 @@ async def proposals_pop(request: Request):
             _store.create_memory(memory_id=mem_id, text=p["text"], source=source, embedding=emb)
         except MemoryConflict:
             pass                     # a pop that died after the memory but before the mark: finish it
-        _ledger.mark_applied(p["id"], mem_id)
+        try:
+            _ledger.mark_applied(p["id"], mem_id)
+        except L.Conflict:
+            continue                 # a concurrent pop applied it first
         applied.append({"proposal": p["id"], "memory": mem_id, "text": p["text"]})
     return JSONResponse({"applied": applied})
 

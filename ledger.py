@@ -329,10 +329,11 @@ class Ledger:
             raise Invalid("redactor required")
         conn = self._tx()
         try:
-            row = conn.execute("SELECT blob, trust, text FROM events WHERE seq = ?", (seq,)).fetchone()
+            row = conn.execute("SELECT blob, trust, text, forgotten_at FROM events WHERE seq = ?", (seq,)).fetchone()
             if row is None:
                 raise NotFound(seq)
-            new_text = row["text"] if text is None else (text.strip() if row["trust"] == "trusted" else "")
+            keeps_text = row["trust"] == "trusted" and row["forgotten_at"] is None
+            new_text = row["text"] if text is None else (text.strip() if keeps_text else "")
             h = _put_blob(conn, raw)
             conn.execute("UPDATE events SET blob = ?, redactor = ?, text = ?, embedded_with = CASE WHEN ? = text "
                          "THEN embedded_with ELSE NULL END WHERE seq = ?", (h, redactor, new_text, new_text, seq))
@@ -362,10 +363,13 @@ class Ledger:
             raise Invalid("note must be a string of at most 2000 characters")
         pid = hashlib.sha256(f"{time.time_ns()}:{text}".encode()).hexdigest()[:16]
         with self.store._conn() as conn:
-            known = {r[0] for r in conn.execute(
-                f"SELECT seq FROM events WHERE seq IN ({','.join('?' * len(events))})", events)} if events else set()
-            if known != set(events):
-                raise Invalid(f"unknown events: {sorted(set(events) - known)}")
+            known = {r[0]: r[1] for r in conn.execute(
+                f"SELECT seq, forgotten_at FROM events WHERE seq IN ({','.join('?' * len(events))})", events)} \
+                if events else {}
+            if set(known) != set(events):
+                raise Invalid(f"unknown events: {sorted(set(events) - set(known))}")
+            if any(known.values()):                  # forgotten means nothing recalls it, a new memory included
+                raise Invalid(f"forgotten events: {sorted(s for s, f in known.items() if f)}")
             conn.execute("INSERT INTO proposals (id, text, status, by, events, note, created_at) "
                          "VALUES (?, ?, 'pending', ?, ?, ?, ?)",
                          (pid, text.strip(), by, json.dumps(sorted(set(events))), note.strip(), now()))
@@ -405,9 +409,11 @@ class Ledger:
             if r[0] != "pending":
                 raise Conflict(f"proposal is {r[0]}")
             status = "accepted" if action == "accept" else "rejected"
-            if text is not None:
-                conn.execute("UPDATE proposals SET text = ? WHERE id = ?", (text.strip(), pid))
-            conn.execute("UPDATE proposals SET status = ?, decided_at = ? WHERE id = ?", (status, now(), pid))
+            cur = conn.execute("UPDATE proposals SET status = ?, decided_at = ?, text = COALESCE(?, text) "
+                               "WHERE id = ? AND status = 'pending'",      # a rival decision may have won meanwhile
+                               (status, now(), text.strip() if text is not None else None, pid))
+            if cur.rowcount != 1:
+                raise Conflict("proposal was decided meanwhile")
         return self.proposal(pid)
 
     def mark_applied(self, pid: str, memory_id: str):
