@@ -175,7 +175,6 @@ def test_proposal_events_must_exist(client):
 
 @pytest.mark.parametrize("method,path,body,role", [
     ("post", "/events", {"events": [ev(1)]}, "ingest"),
-    ("post", "/log", {"request": {"messages": []}}, "ingest"),
     ("post", "/proposals", {"text": "x", "by": "agent"}, "memq"),
     ("post", "/proposals/pop", None, "memq"),
     ("post", "/proposals/abc/decide", {"action": "accept"}, "review"),

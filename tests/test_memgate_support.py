@@ -1,12 +1,10 @@
-"""Tests for the seq / append-only / curated-memory additions.
+"""Tests for curated memories.
 
 Embeddings are stubbed with a deterministic hash vector, so no Ollama is needed.
 Every test runs against a temp database; nothing touches ~/.loom.
 """
 import hashlib
-import sqlite3
 import sys
-import threading
 from pathlib import Path
 
 import pytest
@@ -16,21 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from store import Store  # noqa: E402
-
-OLD_SCHEMA = """
-CREATE TABLE conversations (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
-CREATE TABLE messages (
-    id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
-    content TEXT NOT NULL, model TEXT DEFAULT '', timestamp TEXT NOT NULL,
-    token_count INTEGER DEFAULT 0, latency_ms REAL DEFAULT NULL,
-    reasoning_content TEXT DEFAULT '', finish_reason TEXT DEFAULT '',
-    tool_calls TEXT DEFAULT '[]', provider TEXT DEFAULT '',
-    response_headers TEXT DEFAULT '{}', context_id TEXT DEFAULT '',
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-);
-CREATE INDEX idx_messages_conv ON messages(conversation_id, timestamp);
-"""
-
 
 def stub_vec(text: str) -> list[float]:
     out, i = [], 0
@@ -59,218 +42,19 @@ def embed_down(monkeypatch):
     monkeypatch.setattr(main, "_embed", boom)
 
 
-def log(client, conv, user, assistant):
-    return client.post("/log", json={
-        "request": {"messages": [{"role": "user", "content": user}]},
-        "response": {"choices": [{"message": {"content": assistant}}], "usage": {"total_tokens": 7}},
-        "metadata": {"conversation_id": conv, "model": "m", "provider": "p"},
-    })
-
-
-# ── L1: seq and append-only ────────────────────────────────────────
-
-def test_migration_backfills_seq_in_order(tmp_path):
-    db = tmp_path / "old.db"
-    c = sqlite3.connect(db)
-    c.executescript(OLD_SCHEMA)
-    c.execute("INSERT INTO conversations VALUES ('c1','t0'), ('c2','t0')")
-    rows = [  # equal timestamps on purpose: rowid breaks the tie
-        ("a", "c1", "user", "one", "2026-01-01T00:00:00Z"),
-        ("b", "c1", "assistant", "two", "2026-01-01T00:00:00Z"),
-        ("c", "c1", "user", "three", "2026-01-01T00:00:05Z"),
-        ("d", "c2", "user", "other", "2026-01-01T00:00:01Z"),
-    ]
-    for r in rows:
-        c.execute("INSERT INTO messages (id, conversation_id, role, content, timestamp) "
-                  "VALUES (?,?,?,?,?)", r)
-    c.commit()
-    c.close()
-
-    store = Store(db)
-    msgs = store.get_messages("c1")
-    assert [(m["id"], m["seq"]) for m in msgs] == [("a", 0), ("b", 1), ("c", 2)]
-    assert [(m["id"], m["seq"]) for m in store.get_messages("c2")] == [("d", 0)]
-    # idempotent: opening again changes nothing, and new inserts continue the sequence
-    store2 = Store(db)
-    assert store2.insert_message(msg_id="e", conv_id="c1", role="user", content="four",
-                                 timestamp="2026-01-01T00:01:00Z")
-    assert [m["seq"] for m in store2.get_messages("c1")] == [0, 1, 2, 3]
-
-
-def test_resending_a_message_id_changes_nothing(tmp_path):
-    store = Store(tmp_path / "l.db")
-    store.ensure_conversation("c")
-    assert store.insert_message(msg_id="x", conv_id="c", role="user", content="original",
-                                timestamp="t1") is True
-    assert store.insert_message(msg_id="x", conv_id="c", role="user", content="TAMPERED",
-                                timestamp="t2") is False
-    (m,) = store.get_messages("c")
-    assert m["content"] == "original" and m["seq"] == 0 and m["timestamp"] == "t1"
-
-
-def test_concurrent_inserts_give_unique_dense_seq(tmp_path):
-    store = Store(tmp_path / "l.db")
-    store.ensure_conversation("c")
-    errors = []
-
-    def work(t):
-        try:
-            for i in range(25):
-                store.insert_message(msg_id=f"{t}-{i}", conv_id="c", role="user",
-                                     content="x", timestamp="t")
-        except Exception as e:  # pragma: no cover
-            errors.append(e)
-
-    threads = [threading.Thread(target=work, args=(t,)) for t in range(8)]
-    [t.start() for t in threads]
-    [t.join() for t in threads]
-    assert not errors
-    assert sorted(m["seq"] for m in store.get_messages("c")) == list(range(200))
-
-
-def test_range_endpoint_is_inclusive_and_ordered(client):
-    for i in range(3):
-        log(client, "c", f"u{i}", f"a{i}")  # seq 0..5
-    r = client.get("/conversations/c/messages", params={"from_seq": 1, "to_seq": 3})
-    assert r.status_code == 200
-    got = r.json()["messages"]
-    assert [m["seq"] for m in got] == [1, 2, 3]
-    assert set(got[0]) == {"id", "seq", "role", "content", "timestamp"}
-    assert [m["seq"] for m in client.get("/conversations/c/messages",
-                                         params={"from_seq": 4}).json()["messages"]] == [4, 5]
-    assert [m["seq"] for m in client.get("/conversations/c/messages",
-                                         params={"limit": 2}).json()["messages"]] == [0, 1]
-    assert client.get("/conversations/c/messages",
-                      params={"from_seq": 50}).json()["messages"] == []
-    assert client.get("/conversations/nope/messages").status_code == 404
-
-
-def test_seq_in_conversation_and_search_payloads(client):
-    log(client, "c", "hello there", "general kenobi")
-    msgs = client.get("/conversations/c").json()["messages"]
-    assert [m["seq"] for m in msgs] == [0, 1]
-    hits = client.post("/search", json={"query": "hello there", "limit": 5}).json()["results"]
-    assert hits and hits[0]["seq"] == 0
-
-
-def test_search_seq_is_exact_when_messages_share_role_ts_and_content(client):
-    """Two messages that share (role, timestamp, content) must each report their own seq.
-
-    The vector row names its message id, so the lookup is exact rather than a
-    four-column guess that always resolves to the lowest seq.
-    """
-    st = main._store
-    for mid, text in (("dup1", "same text"), ("dup2", "same text"), ("other", "different")):
-        st.insert_message(msg_id=mid, conv_id="c", role="assistant", content=text,
-                          model="m", timestamp="2026-01-01T00:00:00Z")
-    # One vector row per message, exactly as /log would write them.
-    for mid in ("dup1", "dup2"):
-        st.insert_embedding(embedding=stub_vec("same text"), role="assistant", conv_id="c",
-                            content="same text", timestamp="2026-01-01T00:00:00Z",
-                            message_id=mid)
-    hits = {h["message_id"]: h for h in st.search(stub_vec("same text"), limit=10)}
-    assert set(hits) == {"dup1", "dup2"}
-    assert hits["dup1"]["seq"] == 0
-    assert hits["dup2"]["seq"] == 1          # not 0: the old lookup collapsed both to seq 0
-
-
-def test_log_writes_message_id_so_search_seq_survives_duplicate_text(client):
-    """End to end: two identical turns logged into one conversation keep distinct seqs.
-
-    /log embeds both the user and the assistant message of each turn, so the two
-    identical turns yield four vector rows — the point is that each one resolves to its
-    own seq instead of collapsing onto the first match.
-    """
-    log(client, "c", "same question", "same answer")
-    log(client, "c", "same question", "same answer")
-    st = main._store
-    hits = st.search(stub_vec("same answer"), limit=10)
-    assert len(hits) == 4
-    assert len({h["message_id"] for h in hits}) == 4   # each names its own row
-    assistant = sorted((h["seq"] for h in hits if h["role"] == "assistant"))
-    assert assistant == [1, 3]                         # assistant rows of turn 0 and 1
-    for h in hits:
-        row = client.get("/conversations/c/messages",
-                         params={"from_seq": h["seq"], "to_seq": h["seq"]}).json()["messages"]
-        assert len(row) == 1
-        assert row[0]["content"] == h["content"]       # same seq -> same text as reported
-        assert row[0]["role"] == h["role"]
-
-
-def test_legacy_vec_table_is_rebuilt_and_old_rows_still_searchable(tmp_path):
-    """A pre-message_id database must open, gain the column, and keep its vectors."""
-    import sqlite_vec
-
-    db = tmp_path / "legacy.db"
-    conn = sqlite3.connect(db)
-    conn.enable_load_extension(True)
-    sqlite_vec.load(conn)
-    conn.executescript(OLD_SCHEMA)
-    conn.execute("INSERT INTO conversations (id, created_at) VALUES ('c', 't')")
-    conn.execute("INSERT INTO messages (id, conversation_id, role, content, timestamp) "
-                 "VALUES ('m1', 'c', 'user', 'legacy text', 't1')")
-    conn.execute("CREATE VIRTUAL TABLE vec_messages USING vec0("
-                 "embedding FLOAT[768], +role TEXT, +conv_id TEXT, "
-                 "+content TEXT, +timestamp TEXT)")
-    conn.execute("INSERT INTO vec_messages(embedding, role, conv_id, content, timestamp) "
-                 "VALUES (?, 'user', 'c', 'legacy text', 't1')",
-                 (__import__("json").dumps(stub_vec("legacy text")),))
-    conn.commit()
-    conn.close()
-
-    st = Store(db)                                  # migrates on open
-    hits = st.search(stub_vec("legacy text"), limit=5)
-    assert len(hits) == 1
-    assert hits[0]["content"] == "legacy text"
-    assert hits[0]["message_id"] is None            # old row: id unknown
-    assert hits[0]["seq"] == 0                      # resolved by the fallback lookup
-    # Reopening is idempotent and the column stays.
-    st2 = Store(db)
-    assert st2.search(stub_vec("legacy text"), limit=5)[0]["content"] == "legacy text"
-
-
 def test_health_lists_features(client):
     body = client.get("/health").json()
-    assert body["ok"] is True and set(body["features"]) == {"seq", "memories_v1", "events_v1", "proposals_v1"}
+    assert body["ok"] is True and set(body["features"]) == {"memories_v1", "events_v1", "proposals_v1"}
 
 
-def test_no_route_deletes_or_rewrites_messages(client):
+def test_the_old_log_and_conversation_routes_are_gone(client):
+    paths = {getattr(r, "path", "") for r in client.app.routes}
+    assert not paths & {"/log", "/search", "/conversations", "/conversations/{conv_id}"}
+
+
+def test_no_route_deletes_or_rewrites(client):
     for route in client.app.routes:
-        methods = getattr(route, "methods", set()) or set()
-        if "/memories" in route.path:
-            continue
-        assert not (methods & {"DELETE", "PUT", "PATCH"}), route.path
-
-
-# ── Existing behaviour is unchanged ────────────────────────────────
-
-def test_existing_routes_keep_their_shape(client):
-    r = log(client, "c", "q", "a")
-    assert r.json() == {"id": "c", "stored": True}
-    convs = client.get("/conversations").json()["conversations"]
-    assert set(convs[0]) == {"id", "created_at", "message_count", "model", "first_message"}
-    conv = client.get("/conversations/c").json()
-    assert conv["id"] == "c"
-    assert {"id", "role", "content", "model", "timestamp", "token_count", "latency_ms",
-            "reasoning_content", "finish_reason", "tool_calls", "provider",
-            "response_headers", "context_id"} <= set(conv["messages"][0])
-    assert set(client.get("/stats").json()) == {
-        "conversations", "messages", "context_blobs", "total_tokens", "embeddings",
-        "memory_entries"}
-    hit = client.post("/search", json={"query": "q"}).json()["results"][0]
-    assert {"distance", "role", "conversation_id", "content", "timestamp"} <= set(hit)
-    assert client.get("/conversations/missing").status_code == 404
-
-
-def test_search_still_degrades_to_200_on_embedding_failure(client, embed_down):
-    r = client.post("/search", json={"query": "q"})
-    assert r.status_code == 200 and r.json()["error"] == "embedding failed"
-
-
-def test_mcp_tools_are_unchanged():
-    src = (Path(__file__).resolve().parent.parent / "mcp_server.py").read_text(encoding="utf-8")
-    for name in ("loom_search", "loom_conversations", "loom_conversation", "loom_stats"):
-        assert f'"{name}": {{' in src
+        assert not ((getattr(route, "methods", set()) or set()) & {"DELETE", "PUT", "PATCH"}), route.path
 
 
 # ── L2: curated memories ───────────────────────────────────────────

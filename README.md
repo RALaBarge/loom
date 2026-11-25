@@ -1,235 +1,19 @@
-# Loom — Memory-First LLM Proxy
+# Loom
 
-A local-first system that logs, searches, and learns from every interaction with any LLM API.
+A local store for what an agent harness did, and for the short memories a person chose to keep from it.
 
-## Why Loom?
+- **Events:** every entry the harness wrote (for Pi, one line of a session file), append-only, acked after commit.
+  Trusted text (the person's prompts, final replies) is embedded for search; tool output is kept but never embedded or
+  returned by search.
+- **Proposals:** candidate memories wait in a queue until a person accepts, edits or rejects them.
+- **Memories:** accepted facts with full version history; only active ones are searchable.
 
-LLMs forget. Each conversation starts blank. Loom solves this by:
+SQLite with sqlite-vec; embeddings from Ollama (`nomic-embed-text`, 768 dimensions). Loom stores and searches; it
+does not proxy model calls.
 
-- **Capturing everything** — every request and response to any LLM API
-- **Making it searchable** — semantic search over your interaction history  
-- **Learning from it** — extract and distill key insights for future sessions
-- **Keeping it local** — all data stays on your machine
+## Events and the review queue
 
-Loom is *not* a proxy, router, or tool manager—it only stores and searches.
-
-## Works With Multiple Harnesses
-
-Loom integrates with:
-- ✅ **Claude Code** — hook-based logging + MCP tools
-- ✅ **Pi** — hook-based logging
-- ✅ **OpenCode** — hook-based logging
-- ✅ **Continue.dev** — MCP tools for IDE integration
-- ✅ **Any HTTP client** — direct REST API
-- ✅ **Any hook-based harness** — universal hook handler
-
-See [INTEGRATION.md](INTEGRATION.md) for setup instructions.
-
-## Quick Install
-
-```bash
-git clone https://github.com/RALaBarge/loom.git
-cd loom
-bash install.sh
-python -m loom serve
-```
-
-Then integrate with your harness (see INTEGRATION.md).
-
-## Hook Format
-
-Send a POST to `/log` with this shape:
-
-```json
-{
-  "request": {
-    "messages": [
-      {"role": "user", "content": "what is Loom?"},
-      {"role": "assistant", "content": "..."}
-    ]
-  },
-  "response": {
-    "choices": [
-      {
-        "message": {
-          "content": "Loom is a memory system..."
-        }
-      }
-    ],
-    "usage": {
-      "total_tokens": 150
-    }
-  },
-  "metadata": {
-    "conversation_id": "abc123",
-    "model": "claude-opus-5",
-    "provider": "anthropic"
-  }
-}
-```
-
-Fields:
-- `request`: The chat request (at minimum `messages`)
-- `response`: The chat response (at minimum `choices[0].message.content`)
-- `metadata`: Provider metadata
-  - `conversation_id`: Optional. If omitted, Loom generates a UUID
-  - `model`: Optional model name
-  - `provider`: Optional provider name (e.g., "anthropic", "openai")
-
-Loom extracts the last user message and the first assistant choice, stores both, and embeds them for search.
-
-## API
-
-### `POST /log` — Store an interaction
-
-```bash
-curl -X POST http://localhost:9741/log \
-  -H "Content-Type: application/json" \
-  -d '{
-    "request": {"messages": [{"role": "user", "content": "hello"}]},
-    "response": {"choices": [{"message": {"content": "hi"}}]},
-    "metadata": {"model": "gpt-4"}
-  }'
-```
-
-Response: `{"id": "conv-id", "stored": true}`
-
-### `POST /search` — Semantic search
-
-```bash
-curl -X POST http://localhost:9741/search \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "how do I deploy to production?",
-    "limit": 5,
-    "role": "assistant"
-  }'
-```
-
-Response:
-```json
-{
-  "results": [
-    {
-      "distance": 0.1234,
-      "role": "assistant",
-      "conversation_id": "abc123",
-      "content": "To deploy...",
-      "timestamp": "2025-09-14T12:00:00Z"
-    }
-  ]
-}
-```
-
-Body parameters for `/search`:
-- `query`: Search text (required)
-- `limit`: Max results (default 5, max 100)
-- `role`: Filter by "user" or "assistant" (optional)
-- `conversation_id`: Filter to a specific conversation (optional)
-
-Each result carries `id` (via `message_id`), `seq` and `conversation_id`, so any hit can be
-addressed directly with `GET /conversations/{conversation_id}/messages?from_seq=&to_seq=`.
-
-### `GET /conversations` — List conversations
-
-```bash
-curl http://localhost:9741/conversations?limit=10
-```
-
-Response:
-```json
-{
-  "conversations": [
-    {
-      "id": "abc123",
-      "created_at": "2025-09-14T12:00:00Z",
-      "message_count": 5,
-      "model": "claude-opus-5",
-      "first_message": "what is..."
-    }
-  ]
-}
-```
-
-### `GET /conversations/{id}` — Get conversation messages
-
-```bash
-curl http://localhost:9741/conversations/abc123
-```
-
-### `GET /conversations/{id}/messages` — Read a range of turns
-
-```bash
-curl "http://localhost:9741/conversations/abc123/messages?from_seq=10&to_seq=14&limit=100"
-```
-
-Every message has a per-conversation `seq` (0, 1, 2, ...) assigned when it is stored. The
-range is inclusive, ordered by `seq`, and each item has `id`, `seq`, `role`, `content`,
-`timestamp`. Unknown conversation: `404`. Empty range: an empty list. `limit` defaults to 500 (max 1000).
-
-**Append-only.** Messages are never rewritten: sending a message `id` that already exists
-changes nothing, and no route deletes or edits messages. `seq` also appears in conversation
-reads and search results. Databases created before `seq` existed are migrated on startup
-(rows numbered by timestamp, then insertion order).
-
-**How search resolves `seq`.** Each vector row stores the `messages.id` it came from
-(`vec_messages.message_id`), and search results resolve `seq` by that id, so two messages that
-share role, timestamp and content still report their own `seq`. Search results include
-`message_id` for the same reason. Rows written before `message_id` existed (and therefore have
-it as `NULL`) fall back to matching on `(conversation_id, role, timestamp, content)` and take
-the lowest `seq`, which is ambiguous in exactly that duplicate case — re-logged turns are
-unambiguous, older ones may not be. A database whose `vec_messages` predates the column is
-rebuilt on startup (vectors and row ids preserved), since SQLite cannot add a column to a
-virtual table in place.
-
-### Curated memories
-
-Memories are short facts you chose to keep, separate from the raw log. Each keeps its full
-version history; nothing is ever hard-deleted. Only `active` memories are searchable.
-
-| Route | Body | Effect |
-|---|---|---|
-| `POST /memories` | `{"id"?, "text", "source"?}` | Create version 1 (`source` is any JSON) |
-| `GET /memories?status=active&limit=&offset=` | | List (`status`: active, superseded, retracted, all) |
-| `GET /memories/{id}` | | One memory with all versions |
-| `POST /memories/{id}/revise` | `{"text", "reason"?}` | New version, re-embedded |
-| `POST /memories/{id}/supersede` | `{"new_text"?, "new_id"?, "reason"?}` | Mark superseded; optionally create the replacement in the same transaction |
-| `POST /memories/{id}/retract` | `{"reason"}` | Soft delete |
-| `POST /memories/{id}/touch` | | Update `last_seen_at` only |
-| `POST /memories/search` | `{"query", "limit"}` | Nearest active memories (default 5, max 50) |
-
-If the embedding service is down, these routes return `503 {"error": "embedding unavailable"}`
-and write nothing (unlike `/search`, which still answers `200` with an `error` field).
-Changing a superseded or retracted memory returns `409`.
-
-### `GET /stats` — Storage statistics
-
-```bash
-curl http://localhost:9741/stats
-```
-
-Response:
-```json
-{
-  "conversations": 42,
-  "messages": 250,
-  "embeddings": 248,
-  "total_tokens": 50000
-}
-```
-
-### `GET /health` — Health check
-
-```bash
-curl http://localhost:9741/health
-```
-
-Response: `{"ok": true, "features": ["seq", "memories_v1"]}`. Clients can check `features`
-before relying on the routes above.
-
-## Events and the memory review queue
-
-`ledger.py` adds an append-only event store next to `/log`, and a queue of proposed memories that a person decides.
+`ledger.py` is an append-only event store and a queue of proposed memories that a person decides.
 
 - `POST /events` `{"events": [...]}` stores a batch in one transaction and replies after the commit with one ack per
   event (`seq`, content `hash`, `new`). An event is one entry a harness wrote (for Pi, one session-file line): `source`,
@@ -246,157 +30,54 @@ before relying on the routes above.
   accepted proposal into a memory (source: the proposal, who proposed it, its events).
 
 With `LOOM_TOKENS_DIR` set, each write needs `Authorization: Bearer` with its role's token from `<dir>/<role>.token`:
-`ingest` (events, `/log`), `memq` (propose, pop, touch) and `review` (decide, memory edits, forget, purge, scrub). A role
+`ingest` (events), `memq` (propose, pop, touch) and `review` (decide, memory edits, forget, purge, scrub). A role
 without a token file is locked. Reads stay open. Unset, Loom is open as before.
 
-## CLI
+## Memories
 
-### Start the server
+Memories are short facts you chose to keep, separate from the event log. Each keeps its full
+version history; nothing is ever hard-deleted. Only `active` memories are searchable.
 
-```bash
-loom serve
-```
+| Route | Body | Effect |
+|---|---|---|
+| `POST /memories` | `{"id"?, "text", "source"?}` | Create version 1 (`source` is any JSON) |
+| `GET /memories?status=active&limit=&offset=` | | List (`status`: active, superseded, retracted, all) |
+| `GET /memories/{id}` | | One memory with all versions |
+| `POST /memories/{id}/revise` | `{"text", "reason"?}` | New version, re-embedded |
+| `POST /memories/{id}/supersede` | `{"new_text"?, "new_id"?, "reason"?}` | Mark superseded; optionally create the replacement in the same transaction |
+| `POST /memories/{id}/retract` | `{"reason"}` | Soft delete |
+| `POST /memories/{id}/touch` | | Update `last_seen_at` only |
+| `POST /memories/search` | `{"query", "limit"}` | Nearest active memories (default 5, max 50) |
 
-Or via Docker:
-```bash
-docker-compose up
-```
+If the embedding service is down, these routes return `503 {"error": "embedding unavailable"}`
+and write nothing.
+Changing a superseded or retracted memory returns `409`.
 
-### Search from terminal
+## Other routes
 
-```bash
-loom search "how do I deploy?"
-```
+- `GET /stats`: memory counts by status, and `ledger` (events, untrusted, forgotten, unembedded, blobs, proposals by status).
+- `GET /health`: `{"ok": true, "features": ["memories_v1", "events_v1", "proposals_v1"]}`.
 
-### List conversations
-
-```bash
-loom conversations
-```
-
-### View a conversation
-
-```bash
-loom conversation abc123
-```
-
-## Setup
-
-### 1. Requirements
-
-- Python 3.13+
-- SQLite (included)
-- Ollama running with an embedding model (e.g., `nomic-embed-text`)
-
-### 2. Install
+## Run
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 3. Configure
-
-Copy `.env.example` to `.env` and set the environment variables:
-
-```bash
-LOOM_OLLAMA_URL=http://localhost:11434
-LOOM_EMBED_MODEL=nomic-embed-text
-LOOM_PORT=9741
-LOOM_DB_PATH=~/.loom/loom.db
-```
-
-Before starting Loom, load your `.env` file:
-```bash
-export $(cat .env | xargs)
-loom serve
-```
-
-Or inline:
-```bash
-LOOM_OLLAMA_URL=http://localhost:11434 loom serve
-```
-
-### 4. Start Ollama
-
-```bash
 ollama pull nomic-embed-text
-ollama serve
+python run.py serve          # 127.0.0.1:9741
+python run.py search QUERY   # memories; `events QUERY` for event text; `stats`
 ```
 
-(If Ollama is already running elsewhere, point `LOOM_OLLAMA_URL` to it.)
+Environment: `LOOM_DB_PATH` (default `~/.loom/loom.db`), `LOOM_OLLAMA_URL` (default `http://localhost:11434`),
+`LOOM_EMBED_MODEL`, `LOOM_PORT`, `LOOM_BIND_HOST` (default `127.0.0.1`), `LOOM_TOKENS_DIR`.
 
-### 5. Start Loom
+A database from before the event store keeps its old `conversations`/`messages` tables; nothing reads them any more,
+and they can be dropped by hand.
+
+## Tests
 
 ```bash
-loom serve
+python -m pytest -q tests    # embeddings stubbed, temp databases only
 ```
-
-The server runs on `http://localhost:9741` by default.
-
-## Integration
-
-To send logs from Claude Code, add a hook to `.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "after:request": "curl -X POST http://localhost:9741/log -H 'Content-Type: application/json' -d '{\"request\": ..., \"response\": ...}'"
-  }
-}
-```
-
-(See Claude Code docs for hook details.)
-
-## Edge Cases
-
-- **Partial messages**: Loom stores what's there. Missing fields don't break ingestion.
-- **Embedding failures**: Messages are stored even if embedding fails (searchable by metadata/timestamp).
-- **Malformed JSON**: Returns HTTP 400, logged.
-- **Large messages**: Stored as-is; embeddings are truncated by Ollama.
-
-## Architecture
-
-```
-POST /log
-  ├─ Extract user & assistant messages
-  ├─ Store in messages table
-  ├─ Embed both messages
-  └─ Store embeddings in vec_messages table
-
-POST /search
-  ├─ Embed query
-  ├─ Vector search vec_messages
-  └─ Return top results + metadata
-
-GET /conversations
-  └─ Return from conversations table (with counts)
-```
-
-Database: SQLite with sqlite-vec extension for vector search.
-Embeddings: Ollama HTTP API (768-dim by default).
-
-## Code Structure
-
-- **`main.py`** (239 lines) — FastAPI server with `/log`, `/search`, `/conversations` endpoints
-- **`store.py`** (414 lines) — SQLite + sqlite-vec database layer with vector search
-- **`cli.py`** (187 lines) — Terminal UI for searching and browsing
-- **`run.py`** — Entry point wrapper
-- **`requirements.txt`** — 5 minimal dependencies
-
-Every function is documented. ~850 lines of production-ready code.
-
-## Educational Value
-
-This codebase is a reference implementation for:
-
-- **Memory-augmented LLM systems** — how to build persistent, searchable context
-- **Vector embeddings** — practical use of semantic search (768-dim vectors, Ollama)
-- **SQLite + extensions** — using sqlite-vec for embedded vector storage
-- **FastAPI** — async HTTP server with proper error handling
-- **CLI design** — terminal UI with multiple subcommands
-- **Hook-based logging** — integration without proxying or MITM
-
-Clean code, full documentation, proper error handling. No secrets, no TODOs.
 
 ## License
 
