@@ -274,9 +274,9 @@ def test_scrub_of_an_untrusted_event_never_gives_it_text(client):
 def test_revised_superseded_and_retracted_text_stop_surfacing(client):
     def search(q):
         return client.post("/memories/search", json={"query": q, "limit": 50}).json()["results"]
-    a = client.post("/memories", json={"text": "core is on VM 208"}, headers=H("review")).json()["id"]
+    a = client.post("/memories", json={"text": "core is on a VM"}, headers=H("review")).json()["id"]
     client.post(f"/memories/{a}/revise", json={"text": "core is bare metal"}, headers=H("review"))
-    hits = search("core is on VM 208")
+    hits = search("core is on a VM")
     assert [h["text"] for h in hits] == ["core is bare metal"]        # one row for a, with the new text
     new = client.post(f"/memories/{a}/supersede", json={"new_text": "core is the Wyse ai"},
                       headers=H("review")).json()["superseded_by"]
